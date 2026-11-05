@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include "request.h"
 #include "common.h"
 #include "bsoncxx/builder/basic/document.hpp"
@@ -89,6 +90,15 @@ namespace webcachesim {
             }
             Cache_instance = move(get_factory_instance()[name]->create_unique());
             return Cache_instance;
+        }
+
+        // eviction listener: lets the simulation framework observe which keys a policy evicts
+        // (used for the good decision ratio). Policies call notify_eviction(key) from evict().
+        std::function<void(const uint64_t &)> eviction_listener;
+
+        inline void notify_eviction(const uint64_t &key) {
+            if (eviction_listener)
+                eviction_listener(key);
         }
 
         // basic cache properties

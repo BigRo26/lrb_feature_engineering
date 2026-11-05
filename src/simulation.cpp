@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <numeric>
+#include <cmath>
 #include "bsoncxx/builder/basic/document.hpp"
 #include "bsoncxx/json.hpp"
 
@@ -59,6 +60,16 @@ FrameWork::FrameWork(const string &trace_file, const string &cache_type, const u
         } else if (it->first == "seq_start") {
             seq_start = stoll((it->second));
             ++it;
+        } else if (it->first == "track_good_decision") {
+            track_good_decision = static_cast<bool>(stoi(it->second));
+            it = params.erase(it);
+        } else if (it->first == "belady_boundary") {
+            belady_boundary_param = stod(it->second);
+            it = params.erase(it);
+        } else if (it->first == "byte_million_req") {
+            //also consumed by LRB, so leave it in params
+            byte_million_req = stod(it->second);
+            ++it;
         } else {
             ++it;
         }
@@ -67,6 +78,10 @@ FrameWork::FrameWork(const string &trace_file, const string &cache_type, const u
     //logging eviction requires next_seq information
     is_offline = true;
 #endif
+    //good decision ratio requires next_seq information
+    if (track_good_decision) {
+        is_offline = true;
+    }
 
     //trace_file related init
     if (is_offline) {
@@ -88,6 +103,9 @@ FrameWork::FrameWork(const string &trace_file, const string &cache_type, const u
     if (webcache == nullptr) throw runtime_error("Error: cache type " + cache_type + " not implemented");
     webcache->setSize(cache_size);
     webcache->init_with_params(params);
+    if (track_good_decision) {
+        webcache->eviction_listener = [this](const uint64_t &key) { on_eviction(key); };
+    }
 
     adjust_real_time_offset();
     extra_features = vector<uint16_t>(n_extra_fields);
@@ -106,6 +124,33 @@ void FrameWork::adjust_real_time_offset() {
     infile.seekg(0, ios::beg);
 }
 
+
+double FrameWork::current_belady_boundary() const {
+    double cache_size = webcache->getSize();
+    if (belady_boundary_param > 0)
+        return belady_boundary_param;
+    if (byte_million_req > 0)
+        return cache_size * 1e6 / byte_million_req;
+    if (total_byte_req <= 0)
+        return cache_size;
+    double mean_obj_size = double(total_byte_req) / total_obj_req;
+    return cache_size / mean_obj_size;
+}
+
+void FrameWork::on_eviction(const uint64_t &key) {
+    auto it = next_seq_of.find(key);
+    if (it == next_seq_of.end())
+        return;
+    uint64_t next = it->second;
+    //distance (in requests) from now until the evicted object is requested again.
+    //never-requested-again objects are annotated with 0xffffffff, so they always count as good.
+    double distance = next > abs_seq ? double(next - abs_seq) : 0.;
+    ++n_eviction;
+    if (distance >= current_belady_boundary())
+        ++n_good_eviction;
+    //the object is no longer cached; its entry is re-created on its next request
+    next_seq_of.erase(it);
+}
 
 void FrameWork::update_real_time_stats() {
     rt_seg_byte_miss.emplace_back(rt_byte_miss);
@@ -128,6 +173,14 @@ void FrameWork::update_stats() {
          << endl;
     t_now = _t_now;
     cerr << "segment bmr: " << double(byte_miss) / byte_req << endl;
+    if (track_good_decision) {
+        cerr << "segment good decision ratio: " << (n_eviction ? double(n_good_eviction) / n_eviction : NAN)
+             << " (" << n_good_eviction << "/" << n_eviction << " evictions, belady boundary: "
+             << current_belady_boundary() << " reqs)" << endl;
+        seg_good_eviction.emplace_back(n_good_eviction);
+        seg_eviction.emplace_back(n_eviction);
+        n_good_eviction = n_eviction = 0;
+    }
     seg_byte_miss.emplace_back(byte_miss);
     seg_byte_req.emplace_back(byte_req);
     seg_object_miss.emplace_back(obj_miss);
@@ -174,6 +227,7 @@ bsoncxx::builder::basic::document FrameWork::simulate() {
         if (seq_start_counter++ < seq_start) {
             continue;
         }
+        abs_seq = seq_start_counter - 1;
         if (seq == n_early_stop)
             break;
 
@@ -191,6 +245,10 @@ bsoncxx::builder::basic::document FrameWork::simulate() {
 
         update_metric_req(byte_req, obj_req, size);
         update_metric_req(rt_byte_req, rt_obj_req, size)
+        total_byte_req += size;
+        ++total_obj_req;
+        if (track_good_decision)
+            next_seq_of[id] = next_seq;
 
         if (is_offline)
             dynamic_cast<AnnotatedRequest *>(req)->reinit(seq, id, size, next_seq, &extra_features);
@@ -225,6 +283,21 @@ bsoncxx::builder::basic::document FrameWork::simulate() {
     update_stats();
     infile.close();
 
+    auto bmr = accumulate<vector<int64_t>::const_iterator, double>(seg_byte_miss.begin(), seg_byte_miss.end(), 0) /
+               accumulate<vector<int64_t>::const_iterator, double>(seg_byte_req.begin(), seg_byte_req.end(), 0);
+    cerr << "\nbyte miss ratio: " << bmr << endl;
+    if (track_good_decision) {
+        auto n_good = accumulate<vector<int64_t>::const_iterator, double>(seg_good_eviction.begin(),
+                                                                           seg_good_eviction.end(), 0);
+        auto n_total = accumulate<vector<int64_t>::const_iterator, double>(seg_eviction.begin(),
+                                                                            seg_eviction.end(), 0);
+        cerr << "good decision ratio: " << (n_total ? n_good / n_total : NAN)
+             << " (" << n_good << "/" << n_total << " evictions)" << endl;
+        if (!n_total)
+            cerr << "warning: no evictions observed. Either the cache never filled, or " << _cache_type
+                 << " does not call notify_eviction() in its evict()" << endl;
+    }
+
     return simulation_results();
 }
 
@@ -237,6 +310,22 @@ bsoncxx::builder::basic::document FrameWork::simulation_results() {
                              accumulate<vector<int64_t>::const_iterator, double>(seg_byte_req.begin(),
                                                                                  seg_byte_req.end(), 0)
     ));
+    if (track_good_decision) {
+        auto n_good = accumulate<vector<int64_t>::const_iterator, double>(seg_good_eviction.begin(),
+                                                                           seg_good_eviction.end(), 0);
+        auto n_total = accumulate<vector<int64_t>::const_iterator, double>(seg_eviction.begin(),
+                                                                            seg_eviction.end(), 0);
+        value_builder.append(kvp("no_warmup_good_decision_ratio", n_total ? n_good / n_total : NAN));
+        value_builder.append(kvp("belady_boundary", current_belady_boundary()));
+        value_builder.append(kvp("segment_good_eviction", [this](sub_array child) {
+            for (const auto &element : seg_good_eviction)
+                child.append(element);
+        }));
+        value_builder.append(kvp("segment_eviction", [this](sub_array child) {
+            for (const auto &element : seg_eviction)
+                child.append(element);
+        }));
+    }
 //    value_builder.append(kvp("byte_miss_cache", byte_miss_cache));
 //    value_builder.append(kvp("byte_miss_filter", byte_miss_filter));
     value_builder.append(kvp("segment_byte_miss", [this](sub_array child) {

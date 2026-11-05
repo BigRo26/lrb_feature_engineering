@@ -184,3 +184,19 @@ We ask academic works, which built on this code, to reference the LRB/AdaptSize 
     Daniel S. Berger, Ramesh K. Sitaraman, Mor Harchol-Balter
     USENIX NSDI 2017.
 
+
+## Good decision ratio
+
+Pass `track_good_decision=1` to also report LRB's good decision ratio (NSDI '20, §4): the fraction of evictions whose
+evicted object is next requested at least the Belady boundary in the future (or never again).
+
+```bash
+./webcachesim_cli wiki2018.tr LRB 64424509440 --memory_window=671088640 --track_good_decision=1
+```
+
+- The trace is annotated with next-request indices on first use (`<trace>.ant`, cached afterwards).
+- Boundary (in requests): `belady_boundary=<n>` if given; else `cache_size * 1e6 / byte_million_req` if
+  `byte_million_req` is given; else `cache_size / mean object size` (running mean of requests seen so far).
+- Output: `no_warmup_good_decision_ratio`, `belady_boundary`, `segment_good_eviction`, `segment_eviction` in the JSON,
+  plus per-segment and final lines on stderr. Supported for policies whose `evict()` calls `notify_eviction(key)`
+  (currently LRB and LRU).

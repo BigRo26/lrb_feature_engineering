@@ -124,7 +124,7 @@ void LRUCache::evict()
         ListIteratorType lit = _cacheList.end();
         lit--;
         uint64_t obj = *lit;
-
+        notify_eviction(obj);
 
 #ifdef EVICTION_LOGGING
         {

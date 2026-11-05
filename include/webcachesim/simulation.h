@@ -11,6 +11,7 @@
 #include <vector>
 #include <bsoncxx/builder/basic/document.hpp>
 #include <unordered_set>
+#include <unordered_map>
 #include "cache.h"
 #include "bsoncxx/document/view.hpp"
 #include "bloom_filter.h"
@@ -70,6 +71,30 @@ public:
     //use relative seq starting from 0
     uint64_t seq = 0;
     std::chrono::system_clock::time_point t_now;
+    //=================================================================
+    //good decision ratio (LRB, NSDI '20): an eviction is "good" if the evicted object's next request
+    //is at least belady_boundary requests in the future (or it is never requested again).
+    //enable with param track_good_decision=1. Requires annotating the trace with next_seq.
+    bool track_good_decision = false;
+    //boundary in number of requests. <=0 means derive it:
+    //  if byte_million_req is given: cache_size * 1e6 / byte_million_req (same as LRB's EVICTION_LOGGING)
+    //  otherwise: cache_size / (mean object size of requests seen so far)
+    double belady_boundary_param = -1;
+    double byte_million_req = -1;
+    //object id -> absolute trace index of its next request (from the annotated trace)
+    std::unordered_map<uint64_t, uint64_t> next_seq_of;
+    //absolute index (line number) of the request currently being processed
+    uint64_t abs_seq = 0;
+    //running totals (never reset) for the derived boundary
+    int64_t total_byte_req = 0, total_obj_req = 0;
+    //measure every segment
+    int64_t n_good_eviction = 0, n_eviction = 0;
+    std::vector<int64_t> seg_good_eviction, seg_eviction;
+
+    double current_belady_boundary() const;
+
+    void on_eviction(const uint64_t &key);
+
     //decompose miss
 //    int64_t byte_miss_cache = 0;
 //    int64_t byte_miss_filter = 0;

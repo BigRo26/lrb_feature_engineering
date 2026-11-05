@@ -534,6 +534,7 @@ void LRBCache::evict() {
     auto epair = rank();
     uint64_t &key = epair.first;
     uint32_t &old_pos = epair.second;
+    notify_eviction(key);
 
 #ifdef EVICTION_LOGGING
     {
