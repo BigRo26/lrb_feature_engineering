@@ -446,6 +446,9 @@ pair<uint64_t, uint32_t> LRBCache::rank() {
             else
                 data[idx_feature++] = hash_edc[_distance_idx];
         }
+
+        push_derived(meta, current_seq,
+                     [&](int32_t c, double v) { indices[idx_feature] = c; data[idx_feature++] = v; });
         //remove future t
         indptr[++idx_row] = idx_feature;
     }

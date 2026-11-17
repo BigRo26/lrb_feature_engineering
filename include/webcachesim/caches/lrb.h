@@ -41,6 +41,11 @@ namespace lrb {
     uint32_t batch_size = 131072;
     const uint max_n_extra_feature = 4;
     uint32_t n_feature;
+    // derived features, computed at extraction time from existing metadata (no extra memory).
+    // appended after the EDCs so no existing column index changes. see push_derived().
+    //   0: trend, mean of the n_recent_gaps newest gaps / mean of all stored gaps
+    const uint8_t n_derived_feature = 1;
+    const uint8_t n_recent_gaps = 4;
     //TODO: interval clock should tick by event instead of following incoming packet time
 #ifdef EVICTION_LOGGING
     unordered_map<uint64_t, uint32_t> future_timestamps;
@@ -234,6 +239,35 @@ public:
     }
 };
 
+// Pushes the derived features for one row. Shared by TrainingData::emplace_back,
+// LRBEvictionTrainingData::emplace_back and LRBCache::rank(), so training and prediction
+// always build identical columns. push(column, value) appends one sparse entry.
+// t is the extraction time (sample_timestamp for training, current_seq for prediction);
+// unused by the trend, which only looks at completed gaps.
+template <typename Push>
+inline void push_derived(const Meta &meta, uint32_t t, Push push) {
+    const uint32_t base = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+    if (!meta._extra)                                   // one-hit objects: no completed gap, leave missing
+        return;
+    const MetaExtra *e = meta._extra;
+    const uint8_t n = std::min<uint32_t>(e->_past_distance_idx, max_n_past_distances);
+    // with n <= n_recent_gaps, "recent" and "all" are the same gaps and the ratio is always 1,
+    // which would look like "no trend" rather than "not enough history": leave missing
+    if (n <= n_recent_gaps)
+        return;
+    // completed gaps only (Delta1, the open gap, is excluded), same newest-first walk as the deltas
+    double sum = 0, recent = 0;                         // double: 31 gaps can exceed 2^32
+    for (uint8_t j = 0; j < n; ++j) {
+        const double d = e->_past_distances[(e->_past_distance_idx - 1 - j) % max_n_past_distances];
+        sum += d;
+        if (j < n_recent_gaps)
+            recent += d;
+    }
+    // 0: trend. <1 gaps shrinking (heating up), ~1 steady, >1 gaps growing (cooling off)
+    push(base + 0, (recent / n_recent_gaps) / (sum / n));
+    (void) t;
+}
+
 class TrainingData {
 public:
     vector<float> labels;
@@ -308,8 +342,11 @@ public:
 
         counter += n_edc_feature;
 
+        push_derived(meta, sample_timestamp,
+                     [&](int32_t c, double v) { indices.push_back(c); data.push_back(v); });
+
         labels.push_back(log1p(future_interval));
-        indptr.push_back(counter);
+        indptr.push_back(indices.size());   // replaces the hand-maintained counter, which can't see derived columns
 
 
 #ifdef EVICTION_LOGGING
@@ -422,8 +459,11 @@ public:
 
         counter += n_edc_feature;
 
+        push_derived(meta, sample_timestamp,
+                     [&](int32_t c, double v) { indices.push_back(c); data.push_back(v); });
+
         labels.push_back(log1p(future_interval));
-        indptr.push_back(counter);
+        indptr.push_back(indices.size());   // replaces the hand-maintained counter, which can't see derived columns
 
 
         if (start_train_logging) {
@@ -603,8 +643,8 @@ public:
         }
         set_hash_edc();
 
-        //interval, distances, size, extra_features, n_past_intervals, edwt
-        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+        //interval, distances, size, extra_features, n_past_intervals, edwt, derived
+        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature + n_derived_feature;
         if (n_extra_fields) {
             if (n_extra_fields > max_n_extra_feature) {
                 cerr << "error: only support <= " + to_string(max_n_extra_feature)
