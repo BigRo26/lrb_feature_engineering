@@ -41,12 +41,10 @@ namespace lrb {
     uint32_t batch_size = 131072;
     const uint max_n_extra_feature = 4;
     uint32_t n_feature;
-
-    // index of the "mean time between consecutive accesses" feature. It is the last feature,
-    // after interval, deltas, size, extra fields, n_within and the EDCs, so existing indices are unchanged.
-    inline uint32_t mean_gap_feature_idx() {
-        return max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
-    }
+    // derived features, computed at extraction time from existing metadata (no extra memory).
+    // appended after the EDCs so no existing column index changes. see push_derived().
+    //   0: mean inter-arrival gap
+    const uint8_t n_derived_feature = 1;
     //TODO: interval clock should tick by event instead of following incoming packet time
 #ifdef EVICTION_LOGGING
     unordered_map<uint64_t, uint32_t> future_timestamps;
@@ -89,15 +87,6 @@ struct MetaExtra {
             uint32_t _distance_idx = min(uint32_t(distance / edc_windows[i]), max_hash_edc_idx);
             _edc[i] = _edc[i] * hash_edc[_distance_idx] + 1;
         }
-    }
-
-    // mean time (in requests) between consecutive accesses, over the stored past distances
-    // (the most recent max_n_past_distances gaps). Summed in 64 bits: 31 gaps can exceed 2^32.
-    double mean_past_distance() const {
-        uint64_t sum = 0;
-        for (const auto &d : _past_distances)
-            sum += d;
-        return double(sum) / _past_distances.size();
     }
 };
 
@@ -249,6 +238,29 @@ public:
     }
 };
 
+// Pushes the derived features for one row. Shared by TrainingData::emplace_back,
+// LRBEvictionTrainingData::emplace_back and LRBCache::rank(), so training and prediction
+// always build identical columns. push(column, value) appends one sparse entry.
+// t is the extraction time (sample_timestamp for training, current_seq for prediction);
+// unused by feature 0, needed by later features that compare against Delta1.
+template <typename Push>
+inline void push_derived(const Meta &meta, uint32_t t, Push push) {
+    const uint32_t base = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+    if (!meta._extra)                                   // one-hit objects: no completed gap, leave missing
+        return;
+    const MetaExtra *e = meta._extra;
+    const uint8_t n = std::min<uint32_t>(e->_past_distance_idx, max_n_past_distances);
+    double sum = 0;                                     // double: 31 gaps can exceed 2^32
+    for (uint8_t j = 0; j < n; ++j) {                   // same newest-first walk as the delta features
+        uint8_t past_distance_idx = (e->_past_distance_idx - 1 - j) % max_n_past_distances;
+        sum += e->_past_distances[past_distance_idx];
+    }
+    // 0: mean inter-arrival gap over completed gaps only (Delta1, the open gap, is excluded)
+    const double mean = sum / n;
+    push(base + 0, mean);
+    (void) t;
+}
+
 class TrainingData {
 public:
     vector<float> labels;
@@ -323,15 +335,11 @@ public:
 
         counter += n_edc_feature;
 
-        // mean time between consecutive accesses; omitted (like the deltas) for objects seen only once
-        if (meta._extra) {
-            indices.push_back(mean_gap_feature_idx());
-            data.push_back(meta._extra->mean_past_distance());
-            ++counter;
-        }
+        push_derived(meta, sample_timestamp,
+                     [&](int32_t c, double v) { indices.push_back(c); data.push_back(v); });
 
         labels.push_back(log1p(future_interval));
-        indptr.push_back(counter);
+        indptr.push_back(indices.size());   // replaces the hand-maintained counter, which can't see derived columns
 
 
 #ifdef EVICTION_LOGGING
@@ -444,15 +452,11 @@ public:
 
         counter += n_edc_feature;
 
-        // mean time between consecutive accesses; omitted (like the deltas) for objects seen only once
-        if (meta._extra) {
-            indices.push_back(mean_gap_feature_idx());
-            data.push_back(meta._extra->mean_past_distance());
-            ++counter;
-        }
+        push_derived(meta, sample_timestamp,
+                     [&](int32_t c, double v) { indices.push_back(c); data.push_back(v); });
 
         labels.push_back(log1p(future_interval));
-        indptr.push_back(counter);
+        indptr.push_back(indices.size());   // replaces the hand-maintained counter, which can't see derived columns
 
 
         if (start_train_logging) {
@@ -632,8 +636,8 @@ public:
         }
         set_hash_edc();
 
-        //interval, distances, size, extra_features, n_past_intervals, edwt, mean gap
-        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature + 1;  // +1: mean gap
+        //interval, distances, size, extra_features, n_past_intervals, edwt, derived
+        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature + n_derived_feature;
         if (n_extra_fields) {
             if (n_extra_fields > max_n_extra_feature) {
                 cerr << "error: only support <= " + to_string(max_n_extra_feature)
