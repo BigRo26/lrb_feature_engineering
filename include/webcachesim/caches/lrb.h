@@ -41,6 +41,12 @@ namespace lrb {
     uint32_t batch_size = 131072;
     const uint max_n_extra_feature = 4;
     uint32_t n_feature;
+
+    // index of the "mean time between consecutive accesses" feature. It is the last feature,
+    // after interval, deltas, size, extra fields, n_within and the EDCs, so existing indices are unchanged.
+    inline uint32_t mean_gap_feature_idx() {
+        return max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+    }
     //TODO: interval clock should tick by event instead of following incoming packet time
 #ifdef EVICTION_LOGGING
     unordered_map<uint64_t, uint32_t> future_timestamps;
@@ -83,6 +89,15 @@ struct MetaExtra {
             uint32_t _distance_idx = min(uint32_t(distance / edc_windows[i]), max_hash_edc_idx);
             _edc[i] = _edc[i] * hash_edc[_distance_idx] + 1;
         }
+    }
+
+    // mean time (in requests) between consecutive accesses, over the stored past distances
+    // (the most recent max_n_past_distances gaps). Summed in 64 bits: 31 gaps can exceed 2^32.
+    double mean_past_distance() const {
+        uint64_t sum = 0;
+        for (const auto &d : _past_distances)
+            sum += d;
+        return double(sum) / _past_distances.size();
     }
 };
 
@@ -308,6 +323,13 @@ public:
 
         counter += n_edc_feature;
 
+        // mean time between consecutive accesses; omitted (like the deltas) for objects seen only once
+        if (meta._extra) {
+            indices.push_back(mean_gap_feature_idx());
+            data.push_back(meta._extra->mean_past_distance());
+            ++counter;
+        }
+
         labels.push_back(log1p(future_interval));
         indptr.push_back(counter);
 
@@ -421,6 +443,13 @@ public:
         }
 
         counter += n_edc_feature;
+
+        // mean time between consecutive accesses; omitted (like the deltas) for objects seen only once
+        if (meta._extra) {
+            indices.push_back(mean_gap_feature_idx());
+            data.push_back(meta._extra->mean_past_distance());
+            ++counter;
+        }
 
         labels.push_back(log1p(future_interval));
         indptr.push_back(counter);
@@ -603,8 +632,8 @@ public:
         }
         set_hash_edc();
 
-        //interval, distances, size, extra_features, n_past_intervals, edwt
-        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+        //interval, distances, size, extra_features, n_past_intervals, edwt, mean gap
+        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature + 1;  // +1: mean gap
         if (n_extra_fields) {
             if (n_extra_fields > max_n_extra_feature) {
                 cerr << "error: only support <= " + to_string(max_n_extra_feature)

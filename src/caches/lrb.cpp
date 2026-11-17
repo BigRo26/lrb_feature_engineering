@@ -446,6 +446,12 @@ pair<uint64_t, uint32_t> LRBCache::rank() {
             else
                 data[idx_feature++] = hash_edc[_distance_idx];
         }
+
+        // mean time between consecutive accesses (must match TrainingData::emplace_back)
+        if (meta._extra) {
+            indices[idx_feature] = mean_gap_feature_idx();
+            data[idx_feature++] = meta._extra->mean_past_distance();
+        }
         //remove future t
         indptr[++idx_row] = idx_feature;
     }
