@@ -41,6 +41,10 @@ namespace lrb {
     uint32_t batch_size = 131072;
     const uint max_n_extra_feature = 4;
     uint32_t n_feature;
+    // derived features, computed at extraction time from existing metadata (no extra memory).
+    // appended after the EDCs so no existing column index changes. see push_derived().
+    //   0: overdue ratio, Delta1 / mean inter-arrival gap
+    const uint8_t n_derived_feature = 1;
     //TODO: interval clock should tick by event instead of following incoming packet time
 #ifdef EVICTION_LOGGING
     unordered_map<uint64_t, uint32_t> future_timestamps;
@@ -234,6 +238,31 @@ public:
     }
 };
 
+// Pushes the derived features for one row. Shared by TrainingData::emplace_back,
+// LRBEvictionTrainingData::emplace_back and LRBCache::rank(), so training and prediction
+// always build identical columns. push(column, value) appends one sparse entry.
+// t is the extraction time: sample_timestamp for training, current_seq for prediction.
+template <typename Push>
+inline void push_derived(const Meta &meta, uint32_t t, Push push) {
+    const uint32_t base = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+    if (!meta._extra)                                   // one-hit objects: no completed gap, leave missing
+        return;
+    const MetaExtra *e = meta._extra;
+    const uint8_t n = std::min<uint32_t>(e->_past_distance_idx, max_n_past_distances);
+    double sum = 0;                                     // double: 31 gaps can exceed 2^32
+    for (uint8_t j = 0; j < n; ++j) {                   // same newest-first walk as the delta features
+        uint8_t past_distance_idx = (e->_past_distance_idx - 1 - j) % max_n_past_distances;
+        sum += e->_past_distances[past_distance_idx];
+    }
+    // mean over completed gaps only; Delta1 (the open gap) is excluded so the ratio
+    // doesn't partly compare Delta1 with itself
+    const double mean = sum / n;
+    // Delta1: time since the last request, computed exactly like feature column 0
+    const double delta1 = uint32_t(t - meta._past_timestamp);
+    // 0: overdue ratio. ~1 means on schedule; >>1 means late relative to the object's own history
+    push(base + 0, delta1 / mean);
+}
+
 class TrainingData {
 public:
     vector<float> labels;
@@ -308,8 +337,11 @@ public:
 
         counter += n_edc_feature;
 
+        push_derived(meta, sample_timestamp,
+                     [&](int32_t c, double v) { indices.push_back(c); data.push_back(v); });
+
         labels.push_back(log1p(future_interval));
-        indptr.push_back(counter);
+        indptr.push_back(indices.size());   // replaces the hand-maintained counter, which can't see derived columns
 
 
 #ifdef EVICTION_LOGGING
@@ -422,8 +454,11 @@ public:
 
         counter += n_edc_feature;
 
+        push_derived(meta, sample_timestamp,
+                     [&](int32_t c, double v) { indices.push_back(c); data.push_back(v); });
+
         labels.push_back(log1p(future_interval));
-        indptr.push_back(counter);
+        indptr.push_back(indices.size());   // replaces the hand-maintained counter, which can't see derived columns
 
 
         if (start_train_logging) {
@@ -603,8 +638,8 @@ public:
         }
         set_hash_edc();
 
-        //interval, distances, size, extra_features, n_past_intervals, edwt
-        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature;
+        //interval, distances, size, extra_features, n_past_intervals, edwt, derived
+        n_feature = max_n_past_timestamps + n_extra_fields + 2 + n_edc_feature + n_derived_feature;
         if (n_extra_fields) {
             if (n_extra_fields > max_n_extra_feature) {
                 cerr << "error: only support <= " + to_string(max_n_extra_feature)
