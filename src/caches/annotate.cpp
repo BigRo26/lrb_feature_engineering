@@ -16,6 +16,32 @@ const uint64_t max_next_seq = 0xffffffff;
 using namespace std;
 
 
+// Fast line count with large block reads, so the annotation vector can be sized exactly.
+// Counts '\n' plus one for a final line without a trailing newline.
+static uint64_t count_lines(const string &file) {
+    ifstream in(file, ios::binary);
+    if (!in) {
+        cerr << "Exception opening/reading annotate original file " << file << endl;
+        exit(-1);
+    }
+    vector<char> buf(1 << 24);
+    uint64_t n = 0;
+    char last = '\n';
+    while (in) {
+        in.read(buf.data(), buf.size());
+        streamsize got = in.gcount();
+        if (got <= 0)
+            break;
+        const char *p = buf.data(), *end = buf.data() + got;
+        while ((p = static_cast<const char *>(memchr(p, '\n', end - p)))) {
+            ++n;
+            ++p;
+        }
+        last = buf[got - 1];
+    }
+    return last == '\n' ? n : n + 1;
+}
+
 void annotate(const string &trace_file, const int &n_extra_fields) {
     /*
      * assume trace is less than max(uint32_t)
@@ -29,6 +55,15 @@ void annotate(const string &trace_file, const int &n_extra_fields) {
 
     // in the first path, hold ids; in the reverse path, hold next_seq
     vector<uint64_t> id_and_next_seq;
+    // Reserve the exact size up front. Growing by emplace_back doubles the capacity, and the doubling
+    // at 2^31 entries needs the old 16 GiB plus a new 32 GiB block at once (48 GiB), which fails with
+    // bad_alloc on smaller nodes. Reserved, the full 2.8B-request wiki trace needs ~21 GiB.
+    {
+        uint64_t n_lines = count_lines(trace_file);
+        cerr << "trace has " << n_lines << " lines, reserving "
+             << double(n_lines * sizeof(uint64_t)) / (1ull << 30) << " GiB for annotation" << endl;
+        id_and_next_seq.reserve(n_lines);
+    }
 
     uint64_t id;
     int64_t i = 0;
